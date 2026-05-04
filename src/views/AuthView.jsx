@@ -1,65 +1,80 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useMemo } from 'react';
 import { fetchApi } from '../utils/api';
 import { useToast } from '../components/Toast';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import {
+  useReactTable,
+  getCoreRowModel,
+  flexRender,
+} from '@tanstack/react-table';
 
+// Scopes fetched from API
 export default function AuthView() {
-    const [tokens, setTokens] = useState([]);
-    const [isLoading, setIsLoading] = useState(false);
+    const showToast = useToast();
+    const queryClient = useQueryClient();
+
+    const [showActiveOnly, setShowActiveOnly] = useState(true);
     const [showNewModal, setShowNewModal] = useState(false);
     const [showResultModal, setShowResultModal] = useState(false);
+    const [revokeConfirmTokenId, setRevokeConfirmTokenId] = useState(null);
     const [newToken, setNewToken] = useState('');
-    const [formData, setFormData] = useState({ name: '', scopes: '*', expires: 2592000 });
-    const [isGenerating, setIsGenerating] = useState(false);
-    const showToast = useToast();
+    
+    // New Token form state
+    const [formData, setFormData] = useState({ name: '', expires: 30 });
+    const [selectedScopes, setSelectedScopes] = useState(['*']);
 
-    const loadTokens = async () => {
-        setIsLoading(true);
-        try {
-            const data = await fetchApi('/admin/tokens');
-            setTokens(data.tokens || []);
-        } catch (err) {
-            showToast('error', '加载失败: ' + err.message);
-        } finally {
-            setIsLoading(false);
-        }
-    };
+    const { data, isLoading, isError, error } = useQuery({
+        queryKey: ['tokens'],
+        queryFn: () => fetchApi('/admin/tokens'),
+    });
 
-    useEffect(() => {
-        loadTokens();
-    }, []);
+    const { data: scopesData } = useQuery({
+        queryKey: ['scopes'],
+        queryFn: () => fetchApi('/admin/scopes'),
+    });
 
-    const handleCreate = async (e) => {
-        e.preventDefault();
-        setIsGenerating(true);
-        try {
-            const payload = {
-                name: formData.name,
-                scopes: formData.scopes.split(',').map(s => s.trim()).filter(s => s),
-                expires_in: parseInt(formData.expires)
-            };
-            const res = await fetchApi('/admin/tokens', { method: 'POST', body: JSON.stringify(payload) });
+    const availableScopes = scopesData?.scopes || [];
+
+    const createMutation = useMutation({
+        mutationFn: (payload) => fetchApi('/admin/tokens', { method: 'POST', body: JSON.stringify(payload) }),
+        onSuccess: (res) => {
             setNewToken(res.token);
             setShowNewModal(false);
             setShowResultModal(true);
-            setFormData({ name: '', scopes: '*', expires: 2592000 });
-            loadTokens();
+            setFormData({ name: '', expires: 30 });
+            setSelectedScopes(['*']);
             showToast('success', 'Token 生成成功');
-        } catch (err) {
+            queryClient.invalidateQueries({ queryKey: ['tokens'] });
+        },
+        onError: (err) => {
             showToast('error', err.message);
-        } finally {
-            setIsGenerating(false);
         }
-    };
+    });
 
-    const handleRevoke = async (tokenId) => {
-        if (!window.confirm('确定要吊销此 Token 吗？此操作立即生效且不可恢复。')) return;
-        try {
-            await fetchApi(`/admin/tokens/${tokenId}`, { method: 'DELETE' });
+    const revokeMutation = useMutation({
+        mutationFn: (tokenId) => fetchApi(`/admin/tokens/${tokenId}`, { method: 'DELETE' }),
+        onSuccess: () => {
             showToast('success', '已成功吊销');
-            loadTokens();
-        } catch (err) {
+            setRevokeConfirmTokenId(null);
+            queryClient.invalidateQueries({ queryKey: ['tokens'] });
+        },
+        onError: (err) => {
             showToast('error', '吊销失败: ' + err.message);
+            setRevokeConfirmTokenId(null);
         }
+    });
+
+    const handleCreate = (e) => {
+        e.preventDefault();
+        if (selectedScopes.length === 0) {
+            showToast('error', '请至少选择一个权限范围');
+            return;
+        }
+        createMutation.mutate({
+            name: formData.name,
+            scopes: selectedScopes,
+            expires_in: parseInt(formData.expires) * 86400
+        });
     };
 
     const handleCopy = () => {
@@ -67,57 +82,213 @@ export default function AuthView() {
         showToast('success', '已复制到剪贴板');
     };
 
+    const toggleScope = (scopeId) => {
+        let newScopes = [...selectedScopes];
+
+        if (newScopes.includes(scopeId)) {
+            // Toggling OFF
+            newScopes = newScopes.filter(s => s !== scopeId);
+            if (scopeId === '*') {
+                newScopes = [];
+            } else if (scopeId.endsWith(':*')) {
+                const prefix = scopeId.split(':')[0];
+                newScopes = newScopes.filter(s => !s.startsWith(prefix + ':'));
+            }
+        } else {
+            // Toggling ON
+            if (scopeId === '*') {
+                newScopes = ['*'];
+            } else {
+                newScopes = newScopes.filter(s => s !== '*');
+                if (scopeId.endsWith(':*')) {
+                    const prefix = scopeId.split(':')[0];
+                    newScopes = newScopes.filter(s => !s.startsWith(prefix + ':'));
+                }
+                newScopes.push(scopeId);
+            }
+        }
+        setSelectedScopes(newScopes);
+    };
+
+    const tokens = data?.tokens || [];
+    
+    const filteredTokens = useMemo(() => {
+        if (!showActiveOnly) return tokens;
+        return tokens.filter(t => {
+            const expDate = new Date(t.expires_at);
+            const isExpired = expDate < new Date();
+            return t.status === 'active' && !isExpired;
+        });
+    }, [tokens, showActiveOnly]);
+
+    const columns = useMemo(() => [
+        {
+            header: '用途名称',
+            accessorKey: 'name',
+            cell: info => <strong>{info.getValue()}</strong>
+        },
+        {
+            header: 'Token ID',
+            accessorKey: 'token_id',
+            cell: info => <span style={{fontFamily:'monospace', color:'#94a3b8'}}>{info.getValue().split('-')[1] || info.getValue()}...</span>
+        },
+        {
+            header: '权限范围',
+            accessorKey: 'scopes',
+            cell: info => {
+                let scopes = info.getValue() || [];
+                // 仅为了展示时更精简：覆盖大类时隐藏小类
+                if (scopes.includes('*')) {
+                    scopes = ['*'];
+                } else {
+                    const parentPrefixes = scopes.filter(s => s.endsWith(':*')).map(s => s.split(':')[0]);
+                    scopes = scopes.filter(s => {
+                        if (s.endsWith(':*')) return true;
+                        const parts = s.split(':');
+                        if (parts.length > 1 && parentPrefixes.includes(parts[0])) {
+                            return false; // hide child
+                        }
+                        return true;
+                    });
+                }
+                
+                return scopes.map(s => {
+                    const scopeDef = availableScopes.find(def => def.id === s);
+                    return (
+                        <span key={s} className="badge scope" title={scopeDef ? scopeDef.name : '未知权限'}>
+                            {scopeDef ? scopeDef.name : s}
+                        </span>
+                    );
+                });
+            }
+        },
+        {
+            header: '状态',
+            id: 'status',
+            cell: ({ row }) => {
+                const t = row.original;
+                const expDate = new Date(t.expires_at);
+                const isExpired = t.status === 'active' && expDate < new Date();
+                const statusClass = isExpired ? 'revoked' : (t.status === 'active' ? 'active' : 'revoked');
+                const statusText = isExpired ? '已过期' : (t.status === 'active' ? '生效中' : '已吊销');
+                return <span className={`badge ${statusClass}`}>{statusText}</span>;
+            }
+        },
+        {
+            header: '过期时间',
+            accessorKey: 'expires_at',
+            cell: info => <span style={{fontSize:'13px', color:'#94a3b8'}}>{new Date(info.getValue()).toLocaleString()}</span>
+        },
+        {
+            header: '操作',
+            id: 'actions',
+            cell: ({ row }) => {
+                const t = row.original;
+                const expDate = new Date(t.expires_at);
+                const isExpired = t.status === 'active' && expDate < new Date();
+                if (t.status === 'active' && !isExpired) {
+                    return (
+                        <button className="btn danger-btn" onClick={() => setRevokeConfirmTokenId(t.token_id)}>
+                            <i className="fa-solid fa-ban"></i> 吊销
+                        </button>
+                    );
+                }
+                return null;
+            }
+        }
+    ], [availableScopes]);
+
+    const table = useReactTable({
+        data: filteredTokens,
+        columns,
+        getCoreRowModel: getCoreRowModel(),
+    });
+
     return (
         <section className="view-section">
-            <div className="action-bar">
-                <button className="btn primary-btn" onClick={() => setShowNewModal(true)}><i className="fa-solid fa-plus"></i> 生成新 Token</button>
-                <button className="btn secondary-btn" onClick={loadTokens}><i className="fa-solid fa-rotate-right"></i> 刷新</button>
+            <div className="action-bar" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+                <div style={{ display: 'flex', gap: '12px' }}>
+                    <button className="btn primary-btn" onClick={() => setShowNewModal(true)}>
+                        <i className="fa-solid fa-plus"></i> 生成新 Token
+                    </button>
+                    <button className="btn secondary-btn" onClick={() => queryClient.invalidateQueries({ queryKey: ['tokens'] })} disabled={isLoading || createMutation.isPending || revokeMutation.isPending}>
+                        <i className={`fa-solid fa-rotate-right ${isLoading ? 'fa-spin' : ''}`}></i> 刷新
+                    </button>
+                </div>
+                <div>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', color: 'var(--text-muted)' }}>
+                        <input 
+                            type="checkbox" 
+                            checked={showActiveOnly} 
+                            onChange={(e) => setShowActiveOnly(e.target.checked)} 
+                            style={{ cursor: 'pointer', width: 'auto', margin: 0 }}
+                        />
+                        只显示生效中的密钥
+                    </label>
+                </div>
             </div>
+
+            {isError && (
+                <div className="alert warning-alert" style={{ marginBottom: '20px' }}>
+                    <i className="fa-solid fa-circle-exclamation"></i> 加载失败: {error?.message}
+                </div>
+            )}
+
             <div className="card table-card">
                 <table className="data-table">
                     <thead>
-                        <tr>
-                            <th>用途名称</th>
-                            <th>Token ID</th>
-                            <th>权限 (Scopes)</th>
-                            <th>状态</th>
-                            <th>过期时间</th>
-                            <th>操作</th>
-                        </tr>
+                        {table.getHeaderGroups().map(headerGroup => (
+                            <tr key={headerGroup.id}>
+                                {headerGroup.headers.map(header => (
+                                    <th key={header.id}>
+                                        {flexRender(header.column.columnDef.header, header.getContext())}
+                                    </th>
+                                ))}
+                            </tr>
+                        ))}
                     </thead>
                     <tbody>
                         {isLoading ? (
-                            <tr><td colSpan="6" style={{textAlign:'center'}}><i className="fa-solid fa-spinner fa-spin"></i> 加载中...</td></tr>
-                        ) : tokens.length === 0 ? (
-                            <tr><td colSpan="6" style={{textAlign:'center', color:'#94a3b8'}}>暂无数据</td></tr>
+                            <tr><td colSpan={columns.length} style={{textAlign:'center', padding: '32px'}}><i className="fa-solid fa-spinner fa-spin"></i> 加载中...</td></tr>
+                        ) : table.getRowModel().rows.length === 0 ? (
+                            <tr><td colSpan={columns.length} style={{textAlign:'center', padding: '32px', color:'#94a3b8'}}>暂无数据</td></tr>
                         ) : (
-                            tokens.map(t => {
-                                const expDate = new Date(t.expires_at);
-                                const isExpired = t.status === 'active' && expDate < new Date();
-                                const statusClass = isExpired ? 'revoked' : (t.status === 'active' ? 'active' : 'revoked');
-                                const statusText = isExpired ? '已过期' : (t.status === 'active' ? '生效中' : '已吊销');
-                                
-                                return (
-                                    <tr key={t.token_id}>
-                                        <td><strong>{t.name}</strong></td>
-                                        <td style={{fontFamily:'monospace', color:'#94a3b8'}}>{t.token_id.split('-')[1] || t.token_id}...</td>
-                                        <td>{t.scopes.map(s => <span key={s} className="badge scope">{s}</span>)}</td>
-                                        <td><span className={`badge ${statusClass}`}>{statusText}</span></td>
-                                        <td style={{fontSize:'13px', color:'#94a3b8'}}>{expDate.toLocaleString()}</td>
-                                        <td>
-                                            {(t.status === 'active' && !isExpired) && (
-                                                <button className="btn danger-btn" onClick={() => handleRevoke(t.token_id)}>
-                                                    <i className="fa-solid fa-ban"></i> 吊销
-                                                </button>
-                                            )}
+                            table.getRowModel().rows.map(row => (
+                                <tr key={row.id}>
+                                    {row.getVisibleCells().map(cell => (
+                                        <td key={cell.id}>
+                                            {flexRender(cell.column.columnDef.cell, cell.getContext())}
                                         </td>
-                                    </tr>
-                                )
-                            })
+                                    ))}
+                                </tr>
+                            ))
                         )}
                     </tbody>
                 </table>
             </div>
+
+            {/* Revoke Confirm Modal */}
+            {revokeConfirmTokenId && (
+            <div className="modal-overlay">
+                <div className="modal card" style={{ maxWidth: '400px' }}>
+                    <div className="modal-header">
+                        <h3 style={{ color: 'var(--danger)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <i className="fa-solid fa-triangle-exclamation"></i> 吊销确认
+                        </h3>
+                        <button className="close-btn" type="button" onClick={() => setRevokeConfirmTokenId(null)}><i className="fa-solid fa-xmark"></i></button>
+                    </div>
+                    <div className="modal-body">
+                        <p style={{ marginBottom: '24px', lineHeight: '1.6' }}>确定要吊销此 Token 吗？此操作将立即生效，所有使用该 Token 的请求将被拒绝，且不可恢复。</p>
+                        <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
+                            <button className="btn secondary-btn" onClick={() => setRevokeConfirmTokenId(null)} disabled={revokeMutation.isPending}>取消</button>
+                            <button className="btn danger-btn" onClick={() => revokeMutation.mutate(revokeConfirmTokenId)} disabled={revokeMutation.isPending}>
+                                {revokeMutation.isPending ? <><i className="fa-solid fa-spinner fa-spin"></i> 吊销中...</> : '确认吊销'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            )}
 
             {/* New Token Modal */}
             {showNewModal && (
@@ -133,16 +304,53 @@ export default function AuthView() {
                                 <label>用途名称 (如：前端服务)</label>
                                 <input type="text" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} required />
                             </div>
+                            
                             <div className="form-group">
-                                <label>权限范围 (逗号分隔，如 tts,avatar 或 * 表示全部)</label>
-                                <input type="text" value={formData.scopes} onChange={e => setFormData({...formData, scopes: e.target.value})} required />
+                                <label style={{ marginBottom: '12px' }}>权限范围</label>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', background: 'rgba(15, 23, 42, 0.4)', padding: '12px', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
+                                    {availableScopes.map(scope => {
+                                        const isParent = scope.id === '*' || scope.id.endsWith(':*') || scope.id === 'proxy:admin';
+                                        
+                                        // 检查是否被父级权限覆盖（覆盖则默认勾选且禁用）
+                                        const isCoveredByParent = () => {
+                                            if (scope.id === '*') return false;
+                                            if (selectedScopes.includes('*')) return true;
+                                            
+                                            const parts = scope.id.split(':');
+                                            if (parts.length > 1 && parts[1] !== '*') {
+                                                const parentId = `${parts[0]}:*`;
+                                                if (selectedScopes.includes(parentId)) return true;
+                                            }
+                                            return false;
+                                        };
+                                        
+                                        const covered = isCoveredByParent();
+                                        const checked = covered || selectedScopes.includes(scope.id);
+
+                                        return (
+                                            <label key={scope.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', margin: 0, cursor: covered ? 'not-allowed' : 'pointer', marginLeft: isParent ? '0px' : '24px', opacity: covered ? 0.7 : 1 }}>
+                                                <input 
+                                                    type="checkbox" 
+                                                    checked={checked}
+                                                    disabled={covered}
+                                                    onChange={() => toggleScope(scope.id)}
+                                                    style={{ width: 'auto', cursor: covered ? 'not-allowed' : 'pointer' }}
+                                                />
+                                                <span style={{ color: checked ? 'var(--text-main)' : 'var(--text-muted)' }}>
+                                                    {scope.name}
+                                                </span>
+                                            </label>
+                                        );
+                                    })}
+                                </div>
                             </div>
+
                             <div className="form-group">
-                                <label>有效期 (秒)</label>
-                                <input type="number" value={formData.expires} onChange={e => setFormData({...formData, expires: e.target.value})} required />
+                                <label>有效期 (天) - 默认 30 天</label>
+                                <input type="number" value={formData.expires} onChange={e => setFormData({...formData, expires: e.target.value})} required min="1" />
                             </div>
-                            <button type="submit" className="btn primary-btn full-width" disabled={isGenerating}>
-                                {isGenerating ? <><i className="fa-solid fa-spinner fa-spin"></i> 生成中...</> : '生成'}
+                            <button type="submit" className="btn primary-btn full-width" disabled={createMutation.isPending}>
+                                {createMutation.isPending ? <><i className="fa-solid fa-spinner fa-spin"></i> 生成中...</> : '生成'}
                             </button>
                         </form>
                     </div>
@@ -155,7 +363,9 @@ export default function AuthView() {
             <div className="modal-overlay">
                 <div className="modal card">
                     <div className="modal-header">
-                        <h3>Token 生成成功</h3>
+                        <h3 style={{ color: 'var(--success)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <i className="fa-solid fa-circle-check"></i> 生成成功
+                        </h3>
                         <button className="close-btn" type="button" onClick={() => setShowResultModal(false)}><i className="fa-solid fa-xmark"></i></button>
                     </div>
                     <div className="modal-body">
@@ -165,9 +375,11 @@ export default function AuthView() {
                         </div>
                         <div className="form-group">
                             <label>JWT Token</label>
-                            <textarea readOnly rows="5" value={newToken} />
+                            <textarea readOnly rows="5" value={newToken} style={{ resize: 'none' }} />
                         </div>
-                        <button className="btn primary-btn full-width" onClick={handleCopy}>复制 Token</button>
+                        <button className="btn primary-btn full-width" onClick={handleCopy}>
+                            <i className="fa-solid fa-copy"></i> 复制 Token
+                        </button>
                     </div>
                 </div>
             </div>
