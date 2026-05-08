@@ -18,9 +18,10 @@ export default function AuthView() {
     const [showResultModal, setShowResultModal] = useState(false);
     const [revokeConfirmTokenId, setRevokeConfirmTokenId] = useState(null);
     const [newToken, setNewToken] = useState('');
+    const [newWorkspace, setNewWorkspace] = useState('');
     
     // New Token form state
-    const [formData, setFormData] = useState({ name: '', expires: 30 });
+    const [formData, setFormData] = useState({ name: '', workspace: '', expires: 30 });
     const [selectedScopes, setSelectedScopes] = useState(['*']);
 
     const { data, isLoading, isError, error } = useQuery({
@@ -33,7 +34,13 @@ export default function AuthView() {
         queryFn: () => fetchApi('/admin/scopes'),
     });
 
+    const { data: workspacesData, isLoading: isWorkspacesLoading } = useQuery({
+        queryKey: ['workspaces'],
+        queryFn: () => fetchApi('/admin/workspaces'),
+    });
+
     const availableScopes = scopesData?.scopes || [];
+    const workspaces = workspacesData?.workspaces || [];
 
     const createMutation = useMutation({
         mutationFn: (payload) => fetchApi('/admin/tokens', { method: 'POST', body: JSON.stringify(payload) }),
@@ -41,7 +48,7 @@ export default function AuthView() {
             setNewToken(res.token);
             setShowNewModal(false);
             setShowResultModal(true);
-            setFormData({ name: '', expires: 30 });
+            setFormData({ name: '', workspace: '', expires: 30 });
             setSelectedScopes(['*']);
             showToast('success', 'Token 生成成功');
             queryClient.invalidateQueries({ queryKey: ['tokens'] });
@@ -64,17 +71,66 @@ export default function AuthView() {
         }
     });
 
+    const createWorkspaceMutation = useMutation({
+        mutationFn: (workspace) => fetchApi('/admin/workspaces', {
+            method: 'POST',
+            body: JSON.stringify({ workspace })
+        }),
+        onSuccess: (res) => {
+            setNewWorkspace('');
+            setFormData(prev => ({...prev, workspace: res.workspace}));
+            showToast('success', 'Workspace 创建成功');
+            queryClient.invalidateQueries({ queryKey: ['workspaces'] });
+        },
+        onError: (err) => {
+            showToast('error', err.message);
+        }
+    });
+
+    const deleteWorkspaceMutation = useMutation({
+        mutationFn: (workspace) => fetchApi(`/admin/workspaces/${workspace}`, { method: 'DELETE' }),
+        onSuccess: () => {
+            showToast('success', 'Workspace 已删除');
+            queryClient.invalidateQueries({ queryKey: ['workspaces'] });
+            queryClient.invalidateQueries({ queryKey: ['tokens'] });
+        },
+        onError: (err) => {
+            showToast('error', err.message);
+        }
+    });
+
     const handleCreate = (e) => {
         e.preventDefault();
         if (selectedScopes.length === 0) {
             showToast('error', '请至少选择一个权限范围');
             return;
         }
+        if (!formData.workspace) {
+            showToast('error', '请选择 Workspace');
+            return;
+        }
+        if (!workspaces.some(item => item.workspace === formData.workspace)) {
+            showToast('error', '请选择已存在的 Workspace，或先创建 Workspace');
+            return;
+        }
         createMutation.mutate({
             name: formData.name,
+            workspace: formData.workspace,
             scopes: selectedScopes,
             expires_in: parseInt(formData.expires) * 86400
         });
+    };
+
+    const handleCreateWorkspace = (e) => {
+        e.preventDefault();
+        createWorkspaceMutation.mutate(newWorkspace);
+    };
+
+    const handleDeleteWorkspace = (workspace) => {
+        if (!window.confirm(`确定删除 Workspace「${workspace}」吗？该操作会删除 ${workspace}/ 下所有业务对象，且不可恢复。`)) {
+            return;
+        }
+        deleteWorkspaceMutation.mutate(workspace);
     };
 
     const handleCopy = () => {
@@ -131,6 +187,11 @@ export default function AuthView() {
             header: 'Token ID',
             accessorKey: 'token_id',
             cell: info => <span style={{fontFamily:'monospace', color:'#94a3b8'}}>{info.getValue().split('-')[1] || info.getValue()}...</span>
+        },
+        {
+            header: 'Workspace',
+            accessorKey: 'workspace',
+            cell: info => <span className="badge scope">{info.getValue() || '-'}</span>
         },
         {
             header: '权限范围',
@@ -234,6 +295,50 @@ export default function AuthView() {
                 </div>
             )}
 
+            <div className="card" style={{ marginBottom: '20px' }}>
+                <div className="modal-header" style={{ padding: 0, marginBottom: '16px' }}>
+                    <h3>Workspace 管理</h3>
+                    <button className="btn secondary-btn" onClick={() => queryClient.invalidateQueries({ queryKey: ['workspaces'] })} disabled={isWorkspacesLoading}>
+                        <i className={`fa-solid fa-rotate-right ${isWorkspacesLoading ? 'fa-spin' : ''}`}></i> 刷新
+                    </button>
+                </div>
+                <form onSubmit={handleCreateWorkspace} style={{ display: 'flex', gap: '12px', marginBottom: '16px' }}>
+                    <input
+                        type="text"
+                        value={newWorkspace}
+                        onChange={e => setNewWorkspace(e.target.value)}
+                        placeholder="例如 brand_a"
+                        required
+                        pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
+                        title="1-64 位，仅允许字母、数字、下划线或短横线"
+                    />
+                    <button className="btn primary-btn" type="submit" disabled={createWorkspaceMutation.isPending}>
+                        {createWorkspaceMutation.isPending ? <><i className="fa-solid fa-spinner fa-spin"></i> 创建中...</> : <><i className="fa-solid fa-folder-plus"></i> 新增</>}
+                    </button>
+                </form>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                    {workspaces.length === 0 ? (
+                        <span style={{ color: '#94a3b8', fontSize: '13px' }}>暂无 Workspace，请先创建后再签发 Token。</span>
+                    ) : workspaces.map(item => (
+                        <span key={item.workspace} className="badge scope" title={item.prefix} style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
+                            <i className="fa-solid fa-folder"></i>
+                            {item.workspace}
+                            <span style={{ color: '#94a3b8' }}>{item.object_count || 0}</span>
+                            <button
+                                type="button"
+                                className="close-btn"
+                                style={{ fontSize: '12px', width: '20px', height: '20px' }}
+                                onClick={() => handleDeleteWorkspace(item.workspace)}
+                                disabled={deleteWorkspaceMutation.isPending}
+                                title="删除 Workspace"
+                            >
+                                <i className="fa-solid fa-xmark"></i>
+                            </button>
+                        </span>
+                    ))}
+                </div>
+            </div>
+
             <div className="card table-card">
                 <table className="data-table">
                     <thead>
@@ -303,6 +408,20 @@ export default function AuthView() {
                             <div className="form-group">
                                 <label>用途名称 (如：前端服务)</label>
                                 <input type="text" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} required />
+                            </div>
+
+                            <div className="form-group">
+                                <label>Workspace</label>
+                                <select
+                                    value={formData.workspace}
+                                    onChange={e => setFormData({...formData, workspace: e.target.value})}
+                                    required
+                                >
+                                    <option value="" disabled>请选择 Workspace</option>
+                                    {workspaces.map(item => (
+                                        <option key={item.workspace} value={item.workspace}>{item.workspace}</option>
+                                    ))}
+                                </select>
                             </div>
                             
                             <div className="form-group">
