@@ -21,6 +21,6 @@ export const fetchApi = async (path, options = {}) => {
     
     const res = await fetch(url, { ...options, headers });
     const data = await res.json();
-    if (data.code !== 200) throw new Error(data.message || 'API Error');
+    if (data.code !== 0) throw new Error(data.message || 'API Error');
     return data.body;
 };
